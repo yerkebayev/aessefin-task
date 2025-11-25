@@ -1,8 +1,4 @@
 from typing import Optional, Dict, Any, List, Tuple
-from src.utils.prompt import (
-    ASSISTANT_INSTRUCTIONS,
-    EXTRA_INSTRUCTIONS_IT
-)
 
 def _parse_media(payload: dict) -> List[Tuple[str, str]]:
     files = payload.get("files") or []
@@ -72,44 +68,11 @@ def run_assistant(
     client,
     thread_id: str,
     assistant_id: str,
-    client_info: Optional[str] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "thread_id": thread_id,
         "assistant_id": assistant_id,
         "tool_choice": "auto",
-    }
-
-    parts = [EXTRA_INSTRUCTIONS_IT]
-
-    if client_info:
-        parts.append("Informazioni sul cliente: " + client_info.strip())
-
-    payload["additional_instructions"] = "\n\n".join(
-        p.strip() for p in parts if p and p.strip()
-    )
-
-    payload["response_format"] = {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "multi_turn_reply",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "messages": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "Elenco di brevi messaggi (1–3 frasi ciascuno) "
-                            "nell’ordine in cui devono essere inviati al cliente."
-                        ),
-                    }
-                },
-                "required": ["messages"],
-                "additionalProperties": False,
-            },
-            "strict": True,
-        },
     }
 
     run = client.beta.threads.runs.create(**payload)
