@@ -20,31 +20,31 @@ from src.services.threads_svc import (
 bp = Blueprint("threads", __name__)
 
 # ---------------------------------------------------------------------------
-# Helpers for multi-assistant support (one API key, many assistants)
+# Helpers for multi-assistant support (one API key, multiple assistants)
 # ---------------------------------------------------------------------------
 
 def _load_assistant_ids() -> Dict[str, str]:
     """
-    Загружает соответствие assistant_name -> assistant_id из переменных окружения.
+    Loads mapping of assistant_name -> assistant_id from environment variables.
 
-    Поддерживает два формата:
+    Supports two formats:
 
-    1) Через JSON:
+    1) Via JSON:
        OPENAI_ASSISTANTS_JSON='{"sales": "asst_...", "banking": "asst_..."}'
 
-    2) Через отдельные переменные:
+    2) Via dedicated env vars:
        OPENAI_ASSISTANT_ID_SALES=asst_...
        OPENAI_ASSISTANT_ID_BANKING=asst_...
 
-       Тогда имена ассистентов в URL:
+       In that case, assistant names in URL:
        /chat/sales, /chat/banking
 
-    Также, если задан OPENAI_ASSISTANT_ID,
-    он будет доступен как имя "default" (/chat/default).
+    Additionally, if OPENAI_ASSISTANT_ID is set,
+    it will be available under the name "default" (/chat/default).
     """
     mapping: Dict[str, str] = {}
 
-    # --- Вариант 1: JSON в OPENAI_ASSISTANTS_JSON ---
+    # --- Option 1: JSON in OPENAI_ASSISTANTS_JSON ---
     raw_json = os.getenv("OPENAI_ASSISTANTS_JSON")
     if raw_json:
         try:
@@ -58,22 +58,21 @@ def _load_assistant_ids() -> Dict[str, str]:
                         if isinstance(asst_id, str):
                             mapping[name.lower()] = asst_id
         except Exception:
-            # если JSON кривой — просто игнорируем
+            # If JSON is malformed, ignore silently
             pass
 
-    # --- Вариант 2: отдельные переменные OPENAI_ASSISTANT_ID_<NAME> ---
+    # --- Option 2: individual environment variables OPENAI_ASSISTANT_ID_<NAME> ---
     prefix = "OPENAI_ASSISTANT_ID_"
     for key, value in os.environ.items():
         if key.startswith(prefix):
-            # пример: OPENAI_ASSISTANT_ID_SALES -> "sales"
+            # Example: OPENAI_ASSISTANT_ID_SALES -> "sales"
             name = key[len(prefix):].lower()
             if value:
                 mapping[name] = value
 
-    # --- Дефолтный ассистент (по желанию) ---
+    # --- Default assistant (optional) ---
     default_id = os.getenv("OPENAI_ASSISTANT_ID")
     if default_id:
-        # доступны имена "default" и "" (если вдруг захочешь)
         mapping.setdefault("default", default_id)
 
     return mapping
@@ -84,8 +83,8 @@ ASSISTANT_IDS: Dict[str, str] = _load_assistant_ids()
 
 def _get_assistant_id(assistant_name: str) -> Optional[str]:
     """
-    Возвращает assistant_id по имени ассистента из URL.
-    Игнорирует регистр (sales / SALES / Sales).
+    Returns assistant_id by assistant name from URL.
+    Case-insensitive (sales / SALES / Sales).
     """
     if not assistant_name:
         return None
@@ -158,7 +157,7 @@ def _maybe_parse_messages_json(last_assistant_text: str) -> str:
             if parts:
                 message_text = "\n\n".join(parts)
     except Exception:
-        # Not JSON or wrong format – ignore and fall back
+        # Not JSON or wrong structure – ignore and fall back
         pass
 
     if not message_text:
@@ -177,7 +176,7 @@ def chat_once(assistant_name: str):
     Single-turn chat endpoint.
 
     - assistant_name comes from URL, e.g. "sales", "banking"
-    - For that name we find assistant_id via env (OPENAI_ASSISTANT_ID_<NAME> or JSON)
+    - For that name, we find assistant_id from env (OPENAI_ASSISTANT_ID_<NAME> or JSON)
     - Uses a single OpenAI API key (from env, via build_openai_client)
     """
     # 1. Resolve assistant_id by name
@@ -200,7 +199,7 @@ def chat_once(assistant_name: str):
     thread_id = data.get("thread_id")
     role = data.get("role", "user")
     content_text = data.get("content", "")
-    # Later: extend to accept files: data.get("files", [])
+    # Later: support data.get("files", [])
     url_media: List[Dict[str, Any]] = []
 
     if not content_text and not url_media:
@@ -288,7 +287,7 @@ def chat_once(assistant_name: str):
                 }
             ), 200
 
-        # 9. Convert to a single message string
+        # 9. Convert to single return string
         message_text = _maybe_parse_messages_json(last_assistant_text)
 
         return jsonify(
