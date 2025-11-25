@@ -1,7 +1,10 @@
 from __future__ import annotations
+
+import json
 import os
 import time
-import json
+from typing import Any, Dict, List, Optional, Iterable
+
 from flask import Blueprint, request, jsonify
 
 from src.utils.errors import api_error
@@ -16,32 +19,195 @@ from src.services.threads_svc import (
 
 bp = Blueprint("threads", __name__)
 
-@bp.post("/chat")
-def chat_once():
+# ---------------------------------------------------------------------------
+# Helpers for multi-assistant support (one API key, many assistants)
+# ---------------------------------------------------------------------------
+
+def _load_assistant_ids() -> Dict[str, str]:
+    """
+    Загружает соответствие assistant_name -> assistant_id из переменных окружения.
+
+    Поддерживает два формата:
+
+    1) Через JSON:
+       OPENAI_ASSISTANTS_JSON='{"sales": "asst_...", "banking": "asst_..."}'
+
+    2) Через отдельные переменные:
+       OPENAI_ASSISTANT_ID_SALES=asst_...
+       OPENAI_ASSISTANT_ID_BANKING=asst_...
+
+       Тогда имена ассистентов в URL:
+       /chat/sales, /chat/banking
+
+    Также, если задан OPENAI_ASSISTANT_ID,
+    он будет доступен как имя "default" (/chat/default).
+    """
+    mapping: Dict[str, str] = {}
+
+    # --- Вариант 1: JSON в OPENAI_ASSISTANTS_JSON ---
+    raw_json = os.getenv("OPENAI_ASSISTANTS_JSON")
+    if raw_json:
+        try:
+            data = json.loads(raw_json)
+            if isinstance(data, dict):
+                for name, value in data.items():
+                    if isinstance(value, str):
+                        mapping[name.lower()] = value
+                    elif isinstance(value, dict):
+                        asst_id = value.get("assistant_id")
+                        if isinstance(asst_id, str):
+                            mapping[name.lower()] = asst_id
+        except Exception:
+            # если JSON кривой — просто игнорируем
+            pass
+
+    # --- Вариант 2: отдельные переменные OPENAI_ASSISTANT_ID_<NAME> ---
+    prefix = "OPENAI_ASSISTANT_ID_"
+    for key, value in os.environ.items():
+        if key.startswith(prefix):
+            # пример: OPENAI_ASSISTANT_ID_SALES -> "sales"
+            name = key[len(prefix):].lower()
+            if value:
+                mapping[name] = value
+
+    # --- Дефолтный ассистент (по желанию) ---
+    default_id = os.getenv("OPENAI_ASSISTANT_ID")
+    if default_id:
+        # доступны имена "default" и "" (если вдруг захочешь)
+        mapping.setdefault("default", default_id)
+
+    return mapping
+
+
+ASSISTANT_IDS: Dict[str, str] = _load_assistant_ids()
+
+
+def _get_assistant_id(assistant_name: str) -> Optional[str]:
+    """
+    Возвращает assistant_id по имени ассистента из URL.
+    Игнорирует регистр (sales / SALES / Sales).
+    """
+    if not assistant_name:
+        return None
+    return ASSISTANT_IDS.get(assistant_name.lower())
+
+
+def _extract_last_assistant_text(messages: Iterable[Any]) -> Optional[str]:
+    """
+    From list_messages result, extract the last assistant text message
+    as a single string.
+    """
+    if isinstance(messages, dict) and "data" in messages:
+        iterable = messages["data"]
+    else:
+        iterable = messages
+
+    last_assistant_text: Optional[str] = None
+
+    for m in reversed(list(iterable)):
+        if isinstance(m, dict):
+            role_m = m.get("role")
+            content = m.get("content")
+        else:
+            role_m = getattr(m, "role", None)
+            content = getattr(m, "content", None)
+
+        if role_m != "assistant":
+            continue
+
+        if isinstance(content, str):
+            last_assistant_text = content
+            break
+        elif isinstance(content, list) and content:
+            parts: List[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_obj = block.get("text") or {}
+                    v = text_obj.get("value")
+                    if v:
+                        parts.append(v)
+            if parts:
+                last_assistant_text = "\n\n".join(parts)
+                break
+
+    return last_assistant_text
+
+
+def _maybe_parse_messages_json(last_assistant_text: str) -> str:
+    """
+    If the assistant response is JSON with a "messages" list (as strings),
+    convert it into one multiline string. Otherwise, just strip and return.
+    """
+    if not last_assistant_text:
+        return ""
+
+    last_assistant_text = last_assistant_text.strip()
+    if not last_assistant_text:
+        return ""
+
+    message_text: Optional[str] = None
+
+    try:
+        parsed = json.loads(last_assistant_text)
+        if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
+            parts = [
+                item.strip()
+                for item in parsed["messages"]
+                if isinstance(item, str) and item.strip()
+            ]
+            if parts:
+                message_text = "\n\n".join(parts)
+    except Exception:
+        # Not JSON or wrong format – ignore and fall back
+        pass
+
+    if not message_text:
+        message_text = last_assistant_text
+
+    return message_text
+
+
+# ---------------------------------------------------------------------------
+# Main endpoint
+# ---------------------------------------------------------------------------
+
+@bp.post("/chat/<assistant_name>")
+def chat_once(assistant_name: str):
+    """
+    Single-turn chat endpoint.
+
+    - assistant_name comes from URL, e.g. "sales", "banking"
+    - For that name we find assistant_id via env (OPENAI_ASSISTANT_ID_<NAME> or JSON)
+    - Uses a single OpenAI API key (from env, via build_openai_client)
+    """
+    # 1. Resolve assistant_id by name
+    assistant_id = _get_assistant_id(assistant_name)
+    if not assistant_id:
+        return api_error(f"Unknown assistant '{assistant_name}'.", 404)
+
+    # 2. Build OpenAI client (uses a single API key from env)
     try:
         client = build_openai_client()
     except Exception as e:
-        return api_error(str(e), 500)
+        return api_error(f"Failed to build OpenAI client: {e}", 500)
 
+    # 3. Parse incoming JSON
     try:
         data = request.get_json(force=True) or {}
     except Exception:
         data = {}
 
-    assistant_id = os.getenv("OPENAI_ASSISTANT_ID")
-    if not assistant_id:
-        return api_error("'assistant_id' is required.", 400)
-
     thread_id = data.get("thread_id")
     role = data.get("role", "user")
     content_text = data.get("content", "")
-    url_media = []  # later: data.get("files", [])
+    # Later: extend to accept files: data.get("files", [])
+    url_media: List[Dict[str, Any]] = []
 
     if not content_text and not url_media:
         return api_error("Provide 'content' or 'files' with {url, mediaType}.", 400)
 
     try:
-        # If there is no thread_id – create a new thread
+        # 4. If there is no thread_id – create a new thread
         if not thread_id:
             thread = create_thread(client)
             if isinstance(thread, dict):
@@ -52,7 +218,7 @@ def chat_once():
         if not thread_id:
             return api_error("Could not obtain thread_id.", 500)
 
-        # Post user message into the thread
+        # 5. Post user message into the thread
         post_message2(
             client=client,
             thread_id=thread_id,
@@ -61,11 +227,11 @@ def chat_once():
             url_media=url_media,
         )
 
-        # Run assistant
+        # 6. Run assistant
         run_obj = run_assistant(
-            client,
-            thread_id,
-            assistant_id,
+            client=client,
+            thread_id=thread_id,
+            assistant_id=assistant_id,
         )
 
         if isinstance(run_obj, dict):
@@ -76,12 +242,12 @@ def chat_once():
         if not run_id:
             return api_error("Could not obtain run_id.", 500)
 
-        # Wait for run completion (polling)
+        # 7. Wait for run completion (polling)
         max_wait_seconds = 30
         wait_step = 0.5
         waited = 0.0
         last_run = run_obj
-        status = None
+        status: Optional[str] = None
 
         while waited < max_wait_seconds:
             if isinstance(last_run, dict):
@@ -102,70 +268,36 @@ def chat_once():
                 504,
             )
 
-        # Read last assistant message
-        msgs = list_messages(client, thread_id, after=None, limit=10, run_id=run_id)
+        # 8. Read last assistant message
+        msgs = list_messages(
+            client=client,
+            thread_id=thread_id,
+            after=None,
+            limit=10,
+            run_id=run_id,
+        )
 
-        if isinstance(msgs, dict) and "data" in msgs:
-            iterable = msgs["data"]
-        else:
-            iterable = msgs
-
-        last_assistant_text = None
-
-        for m in reversed(list(iterable)):
-            if isinstance(m, dict):
-                role_m = m.get("role")
-                content = m.get("content")
-            else:
-                role_m = getattr(m, "role", None)
-                content = getattr(m, "content", None)
-
-            if role_m != "assistant":
-                continue
-
-            if isinstance(content, str):
-                last_assistant_text = content
-                break
-            elif isinstance(content, list) and content:
-                parts = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_obj = block.get("text") or {}
-                        v = text_obj.get("value")
-                        if v:
-                            parts.append(v)
-                if parts:
-                    last_assistant_text = "\n\n".join(parts)
-                    break
+        last_assistant_text = _extract_last_assistant_text(msgs)
 
         if not last_assistant_text:
-            return jsonify({
+            return jsonify(
+                {
+                    "assistant": assistant_name,
+                    "thread_id": thread_id,
+                    "message": "",
+                }
+            ), 200
+
+        # 9. Convert to a single message string
+        message_text = _maybe_parse_messages_json(last_assistant_text)
+
+        return jsonify(
+            {
+                "assistant": assistant_name,
                 "thread_id": thread_id,
-                "message": "",
-            }), 200
-
-        # Convert to a single message string
-        message_text = None
-        try:
-            parsed = json.loads(last_assistant_text)
-            if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
-                parts = [
-                    item.strip()
-                    for item in parsed["messages"]
-                    if isinstance(item, str) and item.strip()
-                ]
-                if parts:
-                    message_text = "\n\n".join(parts)
-        except Exception:
-            pass
-
-        if not message_text:
-            message_text = last_assistant_text.strip()
-
-        return jsonify({
-            "thread_id": thread_id,
-            "message": message_text,
-        }), 200
+                "message": message_text,
+            }
+        ), 200
 
     except Exception as e:
         return api_error(str(e), 400)
